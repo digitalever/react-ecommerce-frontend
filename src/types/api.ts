@@ -65,6 +65,8 @@ export interface ApiOrderItem {
 }
 
 export interface CreateOrderPayload {
+  incompleteOrderId?: number;
+  deviceId?: string;
   customerName: string;
   customerPhone: string;
   customerAddress: string;

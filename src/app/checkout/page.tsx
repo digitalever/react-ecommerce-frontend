@@ -5,7 +5,7 @@ import Link from "next/link";
 import Header from "@/components/Header";
 import Footer from "@/components/Footer";
 import { useCart } from "@/context/CartContext";
-import { createOrder } from "@/services/orderService";
+import { createOrder, saveIncompleteOrder } from "@/services/orderService";
 import { fetchSiteSettings, type SiteSetting } from "@/services/settingService";
 import {
   fetchDeliveryCharges,
@@ -16,6 +16,25 @@ import { trackPixelEvent } from "@/lib/pixel";
 import { validateCoupon, type AppliedCoupon } from "@/services/couponService";
 
 const fmt = (v: number) => v.toLocaleString("en-US");
+const DEVICE_ID_KEY = "kafela_device_id";
+
+const normalizePhoneNumber = (value: string) =>
+  value
+    .replace(/[০-৯]/g, (digit) => String("০১২৩৪৫৬৭৮৯".indexOf(digit)))
+    .replace(/\D/g, "");
+
+function getCheckoutDeviceId() {
+  if (typeof window === "undefined") return "";
+  const existing = window.localStorage.getItem(DEVICE_ID_KEY);
+  if (existing) return existing;
+
+  const generated =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+  window.localStorage.setItem(DEVICE_ID_KEY, generated);
+  return generated;
+}
 
 function getCouponErrorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : "";
@@ -45,6 +64,8 @@ function CheckoutContent() {
   const [success,   setSuccess]   = useState(false);
   const [invoiceId, setInvoiceId] = useState("");
   const [errorMsg,  setErrorMsg]  = useState("");
+  const [incompleteOrderId, setIncompleteOrderId] = useState<number | null>(null);
+  const [deviceId, setDeviceId] = useState("");
 
   const allItemsFreeShipping = items.length > 0 && items.every((item) => item.freeShipping === true);
   const regularDeliveryCharge = getDeliveryChargeForDistrict(deliveryCharges, district);
@@ -69,9 +90,71 @@ function CheckoutContent() {
   }, []);
 
   useEffect(() => {
+    setDeviceId(getCheckoutDeviceId());
+  }, []);
+
+  useEffect(() => {
     setAppliedCoupon(null);
     setCouponMessage("");
   }, [totalPrice]);
+
+  useEffect(() => {
+    const normalizedPhone = normalizePhoneNumber(phone);
+    if (success || items.length === 0 || !/^01\d{9}$/.test(normalizedPhone)) return;
+
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      saveIncompleteOrder(
+        {
+          incompleteOrderId: incompleteOrderId || undefined,
+          deviceId,
+          customerName: name.trim() || "Incomplete Customer",
+          customerPhone: normalizedPhone,
+          customerAddress: address.trim(),
+          paymentMethod: payment,
+          items: items.map((i) => ({
+            id: i.id,
+            name: i.name,
+            image: i.image,
+            price: i.price,
+            qty: i.qty,
+            size: i.size,
+            color: i.color,
+            freeShipping: i.freeShipping,
+          })),
+          subtotal: totalPrice,
+          deliveryCharge,
+          discount,
+          couponCode: appliedCoupon?.code || null,
+          total: grandTotal,
+        },
+        controller.signal,
+      )
+        .then((order) => {
+          if (order?.Id) setIncompleteOrderId(order.Id);
+        })
+        .catch(() => {});
+    }, 700);
+
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [
+    address,
+    appliedCoupon?.code,
+    deliveryCharge,
+    discount,
+    grandTotal,
+    incompleteOrderId,
+    items,
+    name,
+    payment,
+    phone,
+    deviceId,
+    success,
+    totalPrice,
+  ]);
 
   const handleApplyCoupon = async () => {
     const code = coupon.trim();
@@ -95,8 +178,13 @@ function CheckoutContent() {
   };
 
   const handleConfirm = async () => {
+    const normalizedPhone = normalizePhoneNumber(phone);
     if (!name || !phone || !address || !district) {
       setErrorMsg("নাম, ফোন, ঠিকানা এবং জেলা পূরণ করুন।");
+      return;
+    }
+    if (!/^01\d{9}$/.test(normalizedPhone)) {
+      setErrorMsg("সঠিক ১১ সংখ্যার ফোন নাম্বার দিন।");
       return;
     }
     if (items.length === 0) {
@@ -107,8 +195,10 @@ function CheckoutContent() {
     setErrorMsg("");
     try {
       const order = await createOrder({
+        incompleteOrderId: incompleteOrderId || undefined,
+        deviceId,
         customerName: name,
-        customerPhone: phone,
+        customerPhone: normalizedPhone,
         customerAddress: address,
         paymentMethod: payment,
         items: items.map((i) => ({
@@ -139,7 +229,12 @@ function CheckoutContent() {
       setSuccess(true);
     } catch (error) {
       const message = error instanceof Error ? error.message : "";
-      if (message.toLowerCase().includes("ip") && message.toLowerCase().includes("blocked")) {
+      const lowerMessage = message.toLowerCase();
+      if (
+        (lowerMessage.includes("ip") && lowerMessage.includes("blocked")) ||
+        lowerMessage.includes("order limit") ||
+        lowerMessage.includes("try again after")
+      ) {
         setErrorMsg("আপনার IP address থেকে অর্ডার গ্রহণ সাময়িকভাবে বন্ধ আছে। সহায়তার জন্য আমাদের সাথে যোগাযোগ করুন।");
       } else {
         setErrorMsg("অর্ডার দেওয়া যায়নি। আবার চেষ্টা করুন।");
